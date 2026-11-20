@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "bulletin-api"
-version = "1.0.0"
+version = "1.1.0"
 description = "Quarterly relief-household bulletin API with cell suppression"
 requires-python = ">=3.11"
 dependencies = [

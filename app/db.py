@@ -56,6 +56,19 @@ CREATE TABLE IF NOT EXISTS bulletins(
     published_by     INTEGER
 );
 
+CREATE TABLE IF NOT EXISTS schedules(
+    quarter          TEXT PRIMARY KEY REFERENCES quarters(quarter),
+    release_at       TEXT NOT NULL,
+    detail_version   INTEGER NOT NULL,
+    mask_version     INTEGER NOT NULL,
+    payload_json     TEXT NOT NULL,
+    schedule_version INTEGER NOT NULL,
+    created_at       TEXT NOT NULL,
+    created_by       INTEGER,
+    updated_at       TEXT NOT NULL,
+    updated_by       INTEGER
+);
+
 CREATE TABLE IF NOT EXISTS editor_tokens(
     id          INTEGER PRIMARY KEY AUTOINCREMENT,
     label       TEXT    NOT NULL,

@@ -11,6 +11,7 @@ import re
 from typing import Annotated
 
 from pydantic import (
+    AwareDatetime,
     BaseModel,
     ConfigDict,
     Field,
@@ -88,6 +89,31 @@ class SuggestionRequest(StrictModel):
 class PublishRequest(StrictModel):
     detail_version: StrictInt | None = Field(default=None, ge=1)
     mask_version: StrictInt | None = Field(default=None, ge=1)
+
+
+class ScheduleRequest(StrictModel):
+    """Create a scheduled release.
+
+    ``release_at`` must be an explicit, timezone-aware moment (it is
+    normalised to UTC); the detail and mask versions identify exactly which
+    draft is sealed.
+    """
+
+    release_at: AwareDatetime
+    detail_version: StrictInt = Field(ge=1)
+    mask_version: StrictInt = Field(ge=1)
+
+
+class ScheduleReplaceRequest(StrictModel):
+    """Swap the sealed draft; the agreed release moment stays unchanged."""
+
+    schedule_version: StrictInt = Field(ge=1)
+    detail_version: StrictInt = Field(ge=1)
+    mask_version: StrictInt = Field(ge=1)
+
+
+class ScheduleCancelRequest(StrictModel):
+    schedule_version: StrictInt = Field(ge=1)
 
 
 class TokenRequest(StrictModel):

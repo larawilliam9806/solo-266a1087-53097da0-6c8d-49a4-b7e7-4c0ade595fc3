@@ -105,8 +105,50 @@ pytest                             # 测试
 * **每季只发一份**：已发布后再次发布 → 409 `already_published`；
   发布失败不会影响已发布的公报，`GET /api/v1/bulletins/{quarter}` 照常可查。
 * 发布是事务性的：校验、快照写入、唯一约束在同一 `BEGIN IMMEDIATE` 事务里完成，并发也不会有第二份。
+* 该季度存在有效排期时，即时发布入口被拒绝（见下节）。
 
-### 6. 公开查询
+### 6. 排期发布（配合新闻稿定时公开）
+
+`PUT /api/v1/editor/quarters/{quarter}/schedule`
+
+```json
+{ "release_at": "2026-01-02T09:00:00Z", "detail_version": 1, "mask_version": 1 }
+```
+
+* `release_at` 必须是**未来的、带时区的时刻**（一律归一化为 UTC；过去时刻 →
+  422 `release_at_not_future`，缺时区或格式非法 → 422 `invalid_request`）。
+* 提交当前明细版号与遮盖版号，按即时发布**同一套规则复核**（`detail_required` /
+  `stale_detail_version` / `mask_required` / `mask_plan_superseded` /
+  `stale_mask_version` / `mask_conflict` 同样适用）；复核通过即**封存稿件快照**，
+  返回 `schedule_version`（排期版号，从 1 起）。
+* 该季度已发布 → 409 `already_published`；已有排期 → 409 `schedule_already_exists`。
+* `GET /api/v1/editor/quarters/{quarter}/schedule` 查看当前排期与封存稿件（编辑接口）。
+
+换稿 / 取消（仅在开放时刻之前）：
+
+```
+POST /api/v1/editor/quarters/{quarter}/schedule/replace
+    { "schedule_version": 1, "detail_version": 2, "mask_version": 1 }
+POST /api/v1/editor/quarters/{quarter}/schedule/cancel
+    { "schedule_version": 1 }
+```
+
+* 凭**所见排期版号**操作，不符 → 409 `stale_schedule_version`。
+* 换稿同样须提交当前明细、遮盖版号并通过复核；**开放时刻照旧**，成功后
+  `schedule_version` 自增。复核未通过、版本冲突或写入失败时**原排期原样保留**。
+* 到点后换稿 / 取消一律 409 `schedule_locked`；到点瞬间仍在复核的换稿自动判负，
+  按原排期开放原稿（封存动作以到点前最后一次成功复核为准）。
+* 取消后该季度恢复自由：可重新即时发布或重新排期。
+* 日常改稿（新明细版本、新遮盖计划）不影响已封存内容。
+
+排期生效期间：
+
+* 即时发布入口对该季度返回 409 `schedule_active`（到点后视为 409 `already_published`）。
+* 到点前公开列表与单季接口均不显示该季度；到点后单季接口返回**最后成功封存的稿件**，
+  列表同步收录，`published_at` 记为约定时刻。
+* 开放是**惰性**的：没有后台任务，服务停机跨过开放时刻后重启即可直接查询。
+
+### 7. 公开查询
 
 `GET /api/v1/bulletins/{quarter}`（公开，无需令牌；不存在时 404，季度格式不合法时 422）
 
@@ -173,5 +215,9 @@ Dockerfile / docker-compose.yml
   `mask_plan_superseded`。
 * **保存与发布分离**：编辑可以先保存一份尚不完整的遮盖（带 `analysis.valid=false` 提示），
   但发布必须完整合规，复核在发布瞬间进行。
+* **排期即快照**：排期复核通过时把公开载荷整体封存（`schedules` 表），之后的日常改稿、
+  失败的换稿都不会污染它；换稿只替换封存快照，约定时刻不变。
+* **惰性开放**：是否开放只在读取时比较当前时间与约定时刻，没有后台任务，也没有
+  「到点触发」的失效窗口——服务停机跨过开放时刻，重启后查询自然返回已开放的公报。
 * **公开载荷最小化**：公开接口只返回合计与可见格；明细版本、遮盖计划、必公开清单等内部
   状态不出现在响应里。

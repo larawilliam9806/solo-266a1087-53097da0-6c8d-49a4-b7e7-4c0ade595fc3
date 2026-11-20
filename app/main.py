@@ -14,14 +14,17 @@ from .models import (
     DetailSubmission,
     MaskSubmission,
     PublishRequest,
+    ScheduleCancelRequest,
+    ScheduleReplaceRequest,
+    ScheduleRequest,
     SuggestionRequest,
     TokenRequest,
     TotalsRegistration,
 )
 from .service import BulletinService
 
-def create_app(db_path: str | None = None) -> FastAPI:
-    service = BulletinService(db_path or db_path_from_env())
+def create_app(db_path: str | None = None, clock=None) -> FastAPI:
+    service = BulletinService(db_path or db_path_from_env(), clock=clock)
     bootstrap_token = service.ensure_editor_token()
 
     app = FastAPI(
@@ -137,6 +140,29 @@ def create_app(db_path: str | None = None) -> FastAPI:
                 body: PublishRequest = Body(default_factory=PublishRequest)
                 ) -> dict[str, Any]:
         return service.publish(quarter, body, editor)
+
+    # ------------------------------------------------------------- scheduling
+
+    @app.get("/api/v1/editor/quarters/{quarter}/schedule")
+    def get_schedule(quarter: Quarter, editor: Editor) -> dict[str, Any]:
+        return service.get_schedule(quarter)
+
+    @app.put("/api/v1/editor/quarters/{quarter}/schedule")
+    def create_schedule(quarter: Quarter, editor: Editor,
+                        body: ScheduleRequest = Body(...)) -> dict[str, Any]:
+        return service.schedule_release(quarter, body, editor)
+
+    @app.post("/api/v1/editor/quarters/{quarter}/schedule/replace")
+    def replace_schedule(quarter: Quarter, editor: Editor,
+                         body: ScheduleReplaceRequest = Body(...),
+                         ) -> dict[str, Any]:
+        return service.replace_schedule(quarter, body, editor)
+
+    @app.post("/api/v1/editor/quarters/{quarter}/schedule/cancel")
+    def cancel_schedule(quarter: Quarter, editor: Editor,
+                        body: ScheduleCancelRequest = Body(...),
+                        ) -> dict[str, Any]:
+        return service.cancel_schedule(quarter, body, editor)
 
     return app
 

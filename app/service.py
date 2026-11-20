@@ -17,6 +17,15 @@ Lifecycle of one quarter:
 
 Only one bulletin per quarter: the first successful publish wins, everything
 afterwards is a 409 conflict.
+
+Alternatively a quarter can be *scheduled* for an agreed future UTC moment
+(press-release coordination).  Scheduling runs the same review as publishing
+and seals an immutable snapshot of the public payload.  Until the release
+moment the sealed draft can be replaced (same review, same release moment) or
+cancelled, each guarded by the schedule version; afterwards the last sealed
+draft is public with ``published_at`` equal to the agreed moment.  Release is
+lazy — it is decided by comparing the clock with the stored moment at read
+time — so a restart across the release moment needs no recovery job.
 """
 
 from __future__ import annotations
@@ -25,7 +34,7 @@ import hashlib
 import json
 import secrets
 from datetime import datetime, timezone
-from typing import Any, Iterable, Sequence
+from typing import Any, Callable, Iterable, Sequence
 
 from . import suppression
 from .db import transaction
@@ -34,6 +43,9 @@ from .models import (
     DetailSubmission,
     MaskSubmission,
     PublishRequest,
+    ScheduleCancelRequest,
+    ScheduleReplaceRequest,
+    ScheduleRequest,
     TotalsRegistration,
 )
 
@@ -108,8 +120,15 @@ def totals_mismatch(issues: list[dict]) -> ApiError:
 
 
 class BulletinService:
-    def __init__(self, db_path: str) -> None:
+    def __init__(self, db_path: str,
+                 clock: Callable[[], datetime] | None = None) -> None:
         self.db_path = db_path
+        # The clock only decides schedule deadlines (future check, release
+        # check); audit timestamps keep using real time via ``now()``.
+        self._clock = clock or (lambda: datetime.now(timezone.utc))
+
+    def _utcnow(self) -> datetime:
+        return self._clock()
 
     # ------------------------------------------------------------------ setup
 
@@ -202,6 +221,26 @@ class BulletinService:
             "SELECT * FROM mask_plans WHERE quarter=? AND detail_version=?",
             (quarter, detail_version),
         ).fetchone()
+
+    @staticmethod
+    def _schedule_row(conn, quarter: str):
+        return conn.execute("SELECT * FROM schedules WHERE quarter=?",
+                            (quarter,)).fetchone()
+
+    def _schedule_released(self, schedule) -> bool:
+        """True once the agreed release moment has been reached."""
+        release_at = datetime.fromisoformat(schedule["release_at"])
+        return release_at.astimezone(timezone.utc) <= self._utcnow()
+
+    @staticmethod
+    def _schedule_locked(schedule, verb: str) -> ApiError:
+        return conflict(
+            "schedule_locked",
+            f"the release time {schedule['release_at']} has passed; the "
+            f"sealed bulletin is public and can no longer be {verb}",
+            {"quarter": schedule["quarter"],
+             "release_at": schedule["release_at"]},
+        )
 
     @staticmethod
     def _cell_list(cells) -> list[dict]:
@@ -485,6 +524,85 @@ class BulletinService:
 
     # ---------------------------------------------------------------- publish
 
+    def _review_sealing(self, conn, quarter: str,
+                        detail_version: int | None, mask_version: int | None,
+                        action: str):
+        """Re-run the full publication review against the current draft.
+
+        Shared by immediate publication, scheduling and scheduled
+        replacement: whichever entry point seals the draft, the same
+        conflicts are reported.
+        """
+        q = self._quarter_row(conn, quarter)
+        latest = self._latest_detail(conn, quarter)
+        if latest is None:
+            raise ApiError(409, "detail_required",
+                           f"submit a detail version before {action}")
+        if detail_version is not None and \
+                detail_version != latest["version"]:
+            raise conflict(
+                "stale_detail_version",
+                "the submitted detail version is outdated; reload and retry",
+                {"submitted_for": detail_version,
+                 "current_detail_version": latest["version"]},
+            )
+        mask_row = self._mask_row(conn, quarter, latest["version"])
+        if mask_row is None:
+            older = conn.execute(
+                "SELECT mask_version, detail_version FROM mask_plans "
+                "WHERE quarter=? AND detail_version<? "
+                "ORDER BY detail_version DESC LIMIT 1",
+                (quarter, latest["version"]),
+            ).fetchone()
+            if older is not None:
+                raise conflict(
+                    "mask_plan_superseded",
+                    "the masking plan belongs to an outdated detail version "
+                    "and cannot be sealed",
+                    {
+                        "superseded_mask_version": older["mask_version"],
+                        "superseded_detail_version": older["detail_version"],
+                        "current_detail_version": latest["version"],
+                        "hint": "review the mask again, then retry",
+                    },
+                )
+            raise conflict(
+                "mask_required",
+                "no masking plan exists for the current detail version",
+                {"detail_version": latest["version"]},
+            )
+        if mask_version is not None and \
+                mask_version != mask_row["mask_version"]:
+            raise conflict(
+                "stale_mask_version",
+                "the masking plan changed since it was reviewed",
+                {"submitted_for": mask_version,
+                 "current_mask_version": mask_row["mask_version"]},
+            )
+
+        values = json.loads(latest["values_json"])
+        must_public = _cells(json.loads(latest["must_public"]))
+        masked = _cells(json.loads(mask_row["cells_json"]))
+        validation = suppression.analyze(values, masked, must_public)
+        if not validation.valid:
+            raise conflict(
+                "mask_conflict",
+                "the masking does not protect every masked cell (or "
+                "conflicts with the must-public list)",
+                {
+                    "cells": [
+                        {"row": r, "col": c}
+                        for r, c in validation.conflict_cells
+                    ],
+                    "issues": [i.as_dict() for i in validation.issues],
+                    "detail_version": latest["version"],
+                    "mask_version": mask_row["mask_version"],
+                    "hint": "call the suppression-advice endpoint to obtain "
+                            "supplementary cells to mask",
+                },
+            )
+        return q, latest, mask_row, values, masked
+
     def publish(self, quarter: str, body: PublishRequest,
                 token_id: int | None) -> dict[str, Any]:
         from .db import connect
@@ -492,7 +610,6 @@ class BulletinService:
         conn = connect(self.db_path)
         try:
             with transaction(conn):
-                q = self._quarter_row(conn, quarter)
                 existing = self._bulletin_row(conn, quarter)
                 if existing is not None:
                     raise conflict(
@@ -503,80 +620,37 @@ class BulletinService:
                          "published_at": existing["published_at"],
                          "detail_version": existing["detail_version"]},
                     )
-                latest = self._latest_detail(conn, quarter)
-                if latest is None:
-                    raise ApiError(409, "detail_required",
-                                   "submit a detail version before publishing")
-                if body.detail_version is not None and \
-                        body.detail_version != latest["version"]:
-                    raise conflict(
-                        "stale_detail_version",
-                        "refusing to publish an outdated detail version",
-                        {"submitted_for": body.detail_version,
-                         "current_detail_version": latest["version"]},
-                    )
-                mask_row = self._mask_row(conn, quarter, latest["version"])
-                if mask_row is None:
-                    older = conn.execute(
-                        "SELECT mask_version, detail_version FROM mask_plans "
-                        "WHERE quarter=? AND detail_version<? "
-                        "ORDER BY detail_version DESC LIMIT 1",
-                        (quarter, latest["version"]),
-                    ).fetchone()
-                    if older is not None:
+                schedule = self._schedule_row(conn, quarter)
+                if schedule is not None:
+                    if self._schedule_released(schedule):
                         raise conflict(
-                            "mask_plan_superseded",
-                            "the masking plan belongs to an outdated detail "
-                            "version and cannot be published",
-                            {
-                                "superseded_mask_version": older["mask_version"],
-                                "superseded_detail_version":
-                                    older["detail_version"],
-                                "current_detail_version": latest["version"],
-                                "hint": "review the mask again, then publish",
-                            },
+                            "already_published",
+                            f"{quarter} was released on schedule at "
+                            f"{schedule['release_at']}",
+                            {"quarter": quarter,
+                             "published_at": schedule["release_at"],
+                             "detail_version": schedule["detail_version"]},
                         )
                     raise conflict(
-                        "mask_required",
-                        "no masking plan exists for the current detail version",
-                        {"detail_version": latest["version"]},
+                        "schedule_active",
+                        f"a scheduled release for {quarter} is pending; "
+                        f"immediate publication is disabled",
+                        {"quarter": quarter,
+                         "release_at": schedule["release_at"],
+                         "schedule_version": schedule["schedule_version"],
+                         "hint": "cancel the schedule before publishing "
+                                 "directly"},
                     )
-                if body.mask_version is not None and \
-                        body.mask_version != mask_row["mask_version"]:
-                    raise conflict(
-                        "stale_mask_version",
-                        "the masking plan changed since it was reviewed",
-                        {"submitted_for": body.mask_version,
-                         "current_mask_version": mask_row["mask_version"]},
-                    )
-
-                values = json.loads(latest["values_json"])
-                must_public = _cells(json.loads(latest["must_public"]))
-                masked = _cells(json.loads(mask_row["cells_json"]))
+                q, latest, mask_row, values, masked = self._review_sealing(
+                    conn, quarter, body.detail_version, body.mask_version,
+                    action="publishing",
+                )
                 row_totals = json.loads(q["row_totals"])
                 col_totals = json.loads(q["col_totals"])
 
-                validation = suppression.analyze(values, masked, must_public)
-                if not validation.valid:
-                    conflict_cells = [
-                        {"row": r, "col": c} for r, c in validation.conflict_cells
-                    ]
-                    raise conflict(
-                        "mask_conflict",
-                        "publication blocked: the masking does not protect every "
-                        "masked cell (or conflicts with the must-public list)",
-                        {
-                            "cells": conflict_cells,
-                            "issues": [i.as_dict() for i in validation.issues],
-                            "detail_version": latest["version"],
-                            "mask_version": mask_row["mask_version"],
-                            "hint": "call the suppression-advice endpoint to "
-                                    "obtain supplementary cells to mask",
-                        },
-                    )
-
                 payload = self._build_payload(
                     quarter, q, values, row_totals, col_totals, masked,
+                    published_at=now(),
                 )
                 try:
                     conn.execute(
@@ -608,7 +682,7 @@ class BulletinService:
 
     @staticmethod
     def _build_payload(quarter, q, values, row_totals, col_totals,
-                       masked) -> dict[str, Any]:
+                       masked, published_at: str) -> dict[str, Any]:
         districts = json.loads(q["district_labels"])
         industries = json.loads(q["industry_labels"])
         visible = [
@@ -632,7 +706,212 @@ class BulletinService:
             # Only published totals and disclosed cells leave the server.
             # ``None`` marks a cell that is not disclosed.
             "cells": visible,
-            "published_at": now(),
+            "published_at": published_at,
+        }
+
+    # -------------------------------------------------------------- schedule
+
+    def schedule_release(self, quarter: str, body: ScheduleRequest,
+                         token_id: int | None) -> dict[str, Any]:
+        """Seal the current draft for an agreed future UTC release moment."""
+        from .db import connect
+
+        release_at = body.release_at.astimezone(timezone.utc)
+        release_iso = release_at.isoformat()
+        conn = connect(self.db_path)
+        try:
+            with transaction(conn):
+                self._quarter_row(conn, quarter)
+                if self._bulletin_row(conn, quarter) is not None:
+                    raise conflict(
+                        "already_published",
+                        f"{quarter} already has a published bulletin; there "
+                        f"is nothing left to schedule",
+                        {"quarter": quarter},
+                    )
+                existing = self._schedule_row(conn, quarter)
+                if existing is not None:
+                    if self._schedule_released(existing):
+                        raise conflict(
+                            "already_published",
+                            f"{quarter} was already released on schedule at "
+                            f"{existing['release_at']}",
+                            {"quarter": quarter,
+                             "published_at": existing["release_at"]},
+                        )
+                    raise conflict(
+                        "schedule_already_exists",
+                        f"a scheduled release for {quarter} already exists; "
+                        f"replace or cancel it instead",
+                        {"quarter": quarter,
+                         "release_at": existing["release_at"],
+                         "schedule_version": existing["schedule_version"]},
+                    )
+                if release_at <= self._utcnow():
+                    raise ApiError(
+                        422, "release_at_not_future",
+                        "the release time must be a future UTC moment",
+                        {"release_at": release_iso,
+                         "now": self._utcnow().isoformat()},
+                    )
+                q, latest, mask_row, values, masked = self._review_sealing(
+                    conn, quarter, body.detail_version, body.mask_version,
+                    action="scheduling",
+                )
+                row_totals = json.loads(q["row_totals"])
+                col_totals = json.loads(q["col_totals"])
+                payload = self._build_payload(
+                    quarter, q, values, row_totals, col_totals, masked,
+                    published_at=release_iso,
+                )
+                stamp = now()
+                conn.execute(
+                    "INSERT INTO schedules(quarter, release_at, "
+                    "detail_version, mask_version, payload_json, "
+                    "schedule_version, created_at, created_by, updated_at, "
+                    "updated_by) VALUES(?,?,?,?,?,?,?,?,?,?)",
+                    (quarter, release_iso, latest["version"],
+                     mask_row["mask_version"], json.dumps(payload), 1,
+                     stamp, token_id, stamp, token_id),
+                )
+        finally:
+            conn.close()
+
+        return {
+            "quarter": quarter,
+            "status": "scheduled",
+            "release_at": release_iso,
+            "detail_version": latest["version"],
+            "mask_version": mask_row["mask_version"],
+            "schedule_version": 1,
+            "payload": payload,
+        }
+
+    def replace_schedule(self, quarter: str, body: ScheduleReplaceRequest,
+                         token_id: int | None) -> dict[str, Any]:
+        """Swap the sealed draft; the agreed release moment stays unchanged.
+
+        Any failure (review, version conflict, write) leaves the original
+        schedule untouched.
+        """
+        from .db import connect
+
+        conn = connect(self.db_path)
+        try:
+            with transaction(conn):
+                self._quarter_row(conn, quarter)
+                schedule = self._schedule_row(conn, quarter)
+                if schedule is None:
+                    raise not_found("schedule", quarter)
+                if self._schedule_released(schedule):
+                    raise self._schedule_locked(schedule, "replaced")
+                if body.schedule_version != schedule["schedule_version"]:
+                    raise conflict(
+                        "stale_schedule_version",
+                        "the schedule changed since it was read; reload and "
+                        "retry",
+                        {"submitted_for": body.schedule_version,
+                         "current_schedule_version":
+                             schedule["schedule_version"]},
+                    )
+                q, latest, mask_row, values, masked = self._review_sealing(
+                    conn, quarter, body.detail_version, body.mask_version,
+                    action="scheduling",
+                )
+                # The deadline is re-checked at sealing time: a replacement
+                # that is still under review when the release moment arrives
+                # loses, and the originally sealed draft goes out as
+                # scheduled.
+                if self._schedule_released(schedule):
+                    raise self._schedule_locked(schedule, "replaced")
+                row_totals = json.loads(q["row_totals"])
+                col_totals = json.loads(q["col_totals"])
+                payload = self._build_payload(
+                    quarter, q, values, row_totals, col_totals, masked,
+                    published_at=schedule["release_at"],
+                )
+                new_version = schedule["schedule_version"] + 1
+                conn.execute(
+                    "UPDATE schedules SET detail_version=?, mask_version=?, "
+                    "payload_json=?, schedule_version=?, updated_at=?, "
+                    "updated_by=? WHERE quarter=?",
+                    (latest["version"], mask_row["mask_version"],
+                     json.dumps(payload), new_version, now(), token_id,
+                     quarter),
+                )
+        finally:
+            conn.close()
+
+        return {
+            "quarter": quarter,
+            "status": "scheduled",
+            "release_at": schedule["release_at"],
+            "detail_version": latest["version"],
+            "mask_version": mask_row["mask_version"],
+            "schedule_version": new_version,
+            "payload": payload,
+        }
+
+    def cancel_schedule(self, quarter: str, body: ScheduleCancelRequest,
+                        token_id: int | None) -> dict[str, Any]:
+        from .db import connect
+
+        conn = connect(self.db_path)
+        try:
+            with transaction(conn):
+                self._quarter_row(conn, quarter)
+                schedule = self._schedule_row(conn, quarter)
+                if schedule is None:
+                    raise not_found("schedule", quarter)
+                if self._schedule_released(schedule):
+                    raise self._schedule_locked(schedule, "cancelled")
+                if body.schedule_version != schedule["schedule_version"]:
+                    raise conflict(
+                        "stale_schedule_version",
+                        "the schedule changed since it was read; reload and "
+                        "retry",
+                        {"submitted_for": body.schedule_version,
+                         "current_schedule_version":
+                             schedule["schedule_version"]},
+                    )
+                conn.execute("DELETE FROM schedules WHERE quarter=?",
+                             (quarter,))
+        finally:
+            conn.close()
+
+        return {
+            "quarter": quarter,
+            "status": "cancelled",
+            "release_at": schedule["release_at"],
+            "schedule_version": body.schedule_version,
+            "note": "the sealed draft was discarded; the quarter can be "
+                    "published or scheduled again",
+        }
+
+    def get_schedule(self, quarter: str) -> dict[str, Any]:
+        """Editor-only view of the current schedule for a quarter."""
+        from .db import connect
+
+        conn = connect(self.db_path)
+        try:
+            self._quarter_row(conn, quarter)
+            schedule = self._schedule_row(conn, quarter)
+            if schedule is None:
+                raise not_found("schedule", quarter)
+            released = self._schedule_released(schedule)
+        finally:
+            conn.close()
+
+        return {
+            "quarter": quarter,
+            "status": "released" if released else "scheduled",
+            "release_at": schedule["release_at"],
+            "detail_version": schedule["detail_version"],
+            "mask_version": schedule["mask_version"],
+            "schedule_version": schedule["schedule_version"],
+            "created_at": schedule["created_at"],
+            "updated_at": schedule["updated_at"],
+            "payload": json.loads(schedule["payload_json"]),
         }
 
     # ----------------------------------------------------------------- reads
@@ -643,9 +922,14 @@ class BulletinService:
         conn = connect(self.db_path)
         try:
             row = self._bulletin_row(conn, quarter)
-            if row is None:
-                raise not_found("bulletin", quarter)
-            return json.loads(row["payload_json"])
+            if row is not None:
+                return json.loads(row["payload_json"])
+            schedule = self._schedule_row(conn, quarter)
+            # A scheduled bulletin becomes visible exactly at the agreed
+            # moment; before that it does not exist for the public.
+            if schedule is not None and self._schedule_released(schedule):
+                return json.loads(schedule["payload_json"])
+            raise not_found("bulletin", quarter)
         finally:
             conn.close()
 
@@ -655,8 +939,15 @@ class BulletinService:
         conn = connect(self.db_path)
         try:
             rows = conn.execute(
-                "SELECT quarter, payload_json FROM bulletins ORDER BY quarter"
+                "SELECT quarter, payload_json FROM bulletins"
             ).fetchall()
+            schedules = conn.execute(
+                "SELECT * FROM schedules"
+            ).fetchall()
+            released = {
+                row["quarter"]: row for row in schedules
+                if self._schedule_released(row)
+            }
         finally:
             conn.close()
         out = []
@@ -667,6 +958,16 @@ class BulletinService:
                 "grand_total": payload["grand_total"],
                 "published_at": payload["published_at"],
             })
+        for quarter, schedule in released.items():
+            if any(item["quarter"] == quarter for item in out):
+                continue
+            payload = json.loads(schedule["payload_json"])
+            out.append({
+                "quarter": quarter,
+                "grand_total": payload["grand_total"],
+                "published_at": payload["published_at"],
+            })
+        out.sort(key=lambda item: item["quarter"])
         return out
 
     def get_admin_state(self, quarter: str) -> dict[str, Any]:
@@ -680,6 +981,7 @@ class BulletinService:
             mask_row = (self._mask_row(conn, quarter, latest["version"])
                         if latest else None)
             bulletin = self._bulletin_row(conn, quarter)
+            schedule = self._schedule_row(conn, quarter)
             versions = conn.execute(
                 "SELECT version, created_at FROM detail_versions "
                 "WHERE quarter=? ORDER BY version",
@@ -709,6 +1011,18 @@ class BulletinService:
             "published_at": bulletin["published_at"] if bulletin else None,
             "bulletin_detail_version": (
                 bulletin["detail_version"] if bulletin else None
+            ),
+            "schedule": (
+                {
+                    "release_at": schedule["release_at"],
+                    "detail_version": schedule["detail_version"],
+                    "mask_version": schedule["mask_version"],
+                    "schedule_version": schedule["schedule_version"],
+                    "created_at": schedule["created_at"],
+                    "updated_at": schedule["updated_at"],
+                    "released": self._schedule_released(schedule),
+                }
+                if schedule else None
             ),
         }
         if latest and mask_row:
